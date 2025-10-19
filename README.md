@@ -120,8 +120,24 @@ Here is the Task Schema:
 2. Clone the repository you created to your local machine.
 3. Install dependencies:
 `npm install`
-4. Start the dev server:
-`npm start`
+4. Create a `.env` file in the project root and set at minimum:
+
+```
+MONGODB_URI=your_mongo_atlas_connection_string
+PORT=3000
+```
+
+5. Install dependencies:
+
+```
+npm install
+```
+
+6. Start the dev server:
+
+```
+npm start
+```
 
 
 
@@ -152,6 +168,14 @@ You can change "localhost" and the port number to match your own running api ser
 **dbFill.py**
 
 `python3 dbFill.py -u "localhost" -p 3000 -n 20 -t 100`
+
+Note: the db scripts call your running API endpoints to create and delete users/tasks. Make sure your server is running and listening on the host/port you pass to the script. The scripts expect standard behavior from the API (validation on required fields, JSON responses with `message` and `data`).
+
+Validation & behavior notes
+- Email addresses are validated with a simple regex on create/update for users; invalid emails return 400.
+- Task deadlines are validated; invalid dates return 400.
+- GET by id endpoints accept an optional `select` query param. If an id in a route is malformed (not a valid ObjectId), the API now returns 404 with a sanitized message rather than surfacing raw Mongoose errors.
+- DELETE endpoints reply with HTTP 204 No Content and send no body (per HTTP spec).
 
 Once again, change the url and port number to match your own running api server. You can populate your database with X users and Y tasks (in the above case, 20 and 100 respectively). This will randomly generate users with realistic names and emails as well as realistic tasks. Tasks will have a 50% chance of being completed and a 60% chance of being assigned. If num_tasks >> num_users, users will likely have multiple tasks assigned to them. A task will have one assigned user at most.
 

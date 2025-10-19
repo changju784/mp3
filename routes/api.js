@@ -1,6 +1,7 @@
 var bodyParser = require('body-parser');
 var User = require('../models/user');
 var Task = require('../models/task');
+var mongoose = require('mongoose');
 
 module.exports = function (router) {
 
@@ -17,10 +18,31 @@ module.exports = function (router) {
 
     // uniform response helpers
     function sendSuccess(res, status, message, data) {
-        res.status(status).json({ message: message, data: data });
+        // For 204 No Content, send empty body per HTTP spec
+        if (status === 204) return res.status(204).send();
+        return res.status(status).json({ message: message, data: data });
     }
     function sendError(res, status, message, data) {
-        res.status(status).json({ message: message, data: data });
+        return res.status(status).json({ message: message, data: data });
+    }
+
+    // helper to validate ObjectId and sanitize id errors
+    function validIdOr404(id, res) {
+        if (!mongoose.Types.ObjectId.isValid(id)) {
+            sendError(res, 404, 'Not Found', 'Resource not found');
+            return false;
+        }
+        return true;
+    }
+
+    // helper to validate email and date
+    function isValidEmail(email) {
+        if (!email || typeof email !== 'string') return false;
+        return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+    }
+    function isValidDate(value) {
+        var d = new Date(value);
+        return !isNaN(d.getTime());
     }
 
     // USERS
@@ -58,6 +80,7 @@ module.exports = function (router) {
     usersRoute.post(function (req, res) {
         var body = req.body || {};
         if (!body.name || !body.email) return sendError(res, 400, 'Bad Request', 'User must have name and email');
+        if (!isValidEmail(body.email)) return sendError(res, 400, 'Bad Request', 'Invalid email format');
 
         var user = new User({
             name: body.name,
@@ -78,6 +101,7 @@ module.exports = function (router) {
     var userIdRoute = router.route('/users/:id');
 
     userIdRoute.get(function (req, res) {
+        if (!validIdOr404(req.params.id, res)) return;
         var select = parseJSONParam(req.query.select);
         var q = User.findById(req.params.id);
         if (select) q = q.select(select);
@@ -92,6 +116,9 @@ module.exports = function (router) {
     userIdRoute.put(function (req, res) {
         var body = req.body || {};
         if (!body.name || !body.email) return sendError(res, 400, 'Bad Request', 'User must have name and email');
+        if (!isValidEmail(body.email)) return sendError(res, 400, 'Bad Request', 'Invalid email format');
+
+        if (!validIdOr404(req.params.id, res)) return;
 
         User.findById(req.params.id, function (err, user) {
             if (err || !user) return sendError(res, 404, 'Not Found', 'User not found');
@@ -114,12 +141,26 @@ module.exports = function (router) {
                 var toRemove = oldPending.filter(function (t) { return saved.pendingTasks.indexOf(t) === -1; });
                 var toAdd = saved.pendingTasks.filter(function (t) { return oldPending.indexOf(t) === -1; });
 
+                // Clear tasks that are no longer pending for this user
                 Task.updateMany({ _id: { $in: toRemove } }, { $set: { assignedUser: '', assignedUserName: 'unassigned' } }, function (e) {
                     if (e) console.error('Error clearing tasks on user update', e);
-                    // assign tasks
-                    Task.updateMany({ _id: { $in: toAdd } }, { $set: { assignedUser: saved._id.toString(), assignedUserName: saved.name } }, function (e2) {
-                        if (e2) console.error('Error assigning tasks on user update', e2);
-                        return sendSuccess(res, 200, 'OK', saved);
+
+                    // Only assign tasks that are not completed. Completed tasks should not be pending.
+                    if (!toAdd || toAdd.length === 0) return sendSuccess(res, 200, 'OK', saved);
+
+                    Task.find({ _id: { $in: toAdd }, completed: false }, function (e3, tasksToAssign) {
+                        if (e3) {
+                            console.error('Error finding tasks to assign on user update', e3);
+                            return sendSuccess(res, 200, 'OK', saved);
+                        }
+
+                        var idsToAssign = (tasksToAssign || []).map(function (t) { return t._id; });
+                        if (!idsToAssign || idsToAssign.length === 0) return sendSuccess(res, 200, 'OK', saved);
+
+                        Task.updateMany({ _id: { $in: idsToAssign } }, { $set: { assignedUser: saved._id.toString(), assignedUserName: saved.name } }, function (e2) {
+                            if (e2) console.error('Error assigning tasks on user update', e2);
+                            return sendSuccess(res, 200, 'OK', saved);
+                        });
                     });
                 });
             });
@@ -128,6 +169,7 @@ module.exports = function (router) {
 
     // DELETE user
     userIdRoute.delete(function (req, res) {
+        if (!validIdOr404(req.params.id, res)) return;
         User.findById(req.params.id, function (err, user) {
             if (err || !user) return sendError(res, 404, 'Not Found', 'User not found');
 
@@ -178,6 +220,7 @@ module.exports = function (router) {
     tasksRoute.post(function (req, res) {
         var body = req.body || {};
         if (!body.name || !body.deadline) return sendError(res, 400, 'Bad Request', 'Task must have name and deadline');
+        if (!isValidDate(body.deadline)) return sendError(res, 400, 'Bad Request', 'Invalid deadline');
 
         var task = new Task({
             name: body.name,
@@ -211,6 +254,7 @@ module.exports = function (router) {
     var taskIdRoute = router.route('/tasks/:id');
 
     taskIdRoute.get(function (req, res) {
+        if (!validIdOr404(req.params.id, res)) return;
         var select = parseJSONParam(req.query.select);
         var q = Task.findById(req.params.id);
         if (select) q = q.select(select);
@@ -224,6 +268,9 @@ module.exports = function (router) {
     taskIdRoute.put(function (req, res) {
         var body = req.body || {};
         if (!body.name || !body.deadline) return sendError(res, 400, 'Bad Request', 'Task must have name and deadline');
+        if (!isValidDate(body.deadline)) return sendError(res, 400, 'Bad Request', 'Invalid deadline');
+
+        if (!validIdOr404(req.params.id, res)) return;
 
         Task.findById(req.params.id, function (err, task) {
             if (err || !task) return sendError(res, 404, 'Not Found', 'Task not found');

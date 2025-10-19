@@ -3,4 +3,6 @@
  */
 module.exports = function (app, router) {
     app.use('/api', require('./home.js')(router));
+    // mount api endpoints
+    app.use('/api', require('./api')(router));
 };

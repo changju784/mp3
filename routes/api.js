@@ -2,6 +2,7 @@ var bodyParser = require('body-parser');
 var User = require('../models/user');
 var Task = require('../models/task');
 var mongoose = require('mongoose');
+var validate = require('../validate');
 
 module.exports = function (router) {
 
@@ -35,15 +36,10 @@ module.exports = function (router) {
         return true;
     }
 
-    // helper to validate email and date
-    function isValidEmail(email) {
-        if (!email || typeof email !== 'string') return false;
-        return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
-    }
-    function isValidDate(value) {
-        var d = new Date(value);
-        return !isNaN(d.getTime());
-    }
+    // helper wrappers (delegated to validate.js)
+    // validate.isValidEmail and validate.isValidDate are available
+
+    // validate.js provides findUserByIdOrName and validatePendingTasks
 
     // USERS
     var usersRoute = router.route('/users');
@@ -80,20 +76,38 @@ module.exports = function (router) {
     usersRoute.post(function (req, res) {
         var body = req.body || {};
         if (!body.name || !body.email) return sendError(res, 400, 'Bad Request', 'User must have name and email');
-        if (!isValidEmail(body.email)) return sendError(res, 400, 'Bad Request', 'Invalid email format');
+        if (!validate.isValidEmail(body.email)) return sendError(res, 400, 'Bad Request', 'Invalid email format');
 
-        var user = new User({
-            name: body.name,
-            email: body.email,
-            pendingTasks: Array.isArray(body.pendingTasks) ? body.pendingTasks : [],
-        });
+        // Validate pendingTasks if provided
+        validate.validatePendingTasks(body.pendingTasks, function (ptValidation) {
+            if (!ptValidation.valid) return sendError(res, 400, 'Bad Request', ptValidation.error);
 
-        user.save(function (err, saved) {
-            if (err) {
-                if (err.code === 11000) return sendError(res, 400, 'Bad Request', 'A user with that email already exists');
-                return sendError(res, 500, 'Internal Server Error', 'Error saving user');
-            }
-            return sendSuccess(res, 201, 'Created', saved);
+            var user = new User({
+                name: body.name,
+                email: body.email,
+                pendingTasks: Array.isArray(body.pendingTasks) ? body.pendingTasks : [],
+            });
+
+            user.save(function (err, saved) {
+                if (err) {
+                    if (err.code === 11000) return sendError(res, 400, 'Bad Request', 'A user with that email already exists');
+                    return sendError(res, 500, 'Internal Server Error', 'Error saving user');
+                }
+
+                // If pendingTasks were provided, assign those tasks to this user (they were validated as existing & not completed)
+                var idsToAssign = (ptValidation.tasks || []).map(function (t) { return t._id.toString(); });
+                if (idsToAssign.length === 0) return sendSuccess(res, 201, 'Created', saved);
+
+                // Set assignedUser/assignedUserName on those tasks
+                Task.updateMany({ _id: { $in: idsToAssign } }, { $set: { assignedUser: saved._id.toString(), assignedUserName: saved.name } }, function (e) {
+                    if (e) console.error('Error assigning tasks on user create', e);
+                    // Remove these tasks from any other user's pendingTasks
+                    User.updateMany({ _id: { $ne: saved._id }, pendingTasks: { $in: idsToAssign } }, { $pull: { pendingTasks: { $in: idsToAssign } } }, function (e2) {
+                        if (e2) console.error('Error cleaning other users pendingTasks on user create', e2);
+                        return sendSuccess(res, 201, 'Created', saved);
+                    });
+                });
+            });
         });
     });
 
@@ -116,7 +130,7 @@ module.exports = function (router) {
     userIdRoute.put(function (req, res) {
         var body = req.body || {};
         if (!body.name || !body.email) return sendError(res, 400, 'Bad Request', 'User must have name and email');
-        if (!isValidEmail(body.email)) return sendError(res, 400, 'Bad Request', 'Invalid email format');
+        if (!validate.isValidEmail(body.email)) return sendError(res, 400, 'Bad Request', 'Invalid email format');
 
         if (!validIdOr404(req.params.id, res)) return;
 
@@ -126,40 +140,41 @@ module.exports = function (router) {
             // store old pending tasks for cleanup
             var oldPending = user.pendingTasks || [];
 
-            user.name = body.name;
-            user.email = body.email;
-            user.pendingTasks = Array.isArray(body.pendingTasks) ? body.pendingTasks : [];
+            // Validate pendingTasks array before saving
+            var newPending = Array.isArray(body.pendingTasks) ? body.pendingTasks : [];
+            validate.validatePendingTasks(newPending, function (ptValidation) {
+                if (!ptValidation.valid) return sendError(res, 400, 'Bad Request', ptValidation.error);
 
-            user.save(function (err, saved) {
-                if (err) {
-                    if (err.code === 11000) return sendError(res, 400, 'Bad Request', 'A user with that email already exists');
-                    return sendError(res, 500, 'Internal Server Error', 'Error saving user');
-                }
+                user.name = body.name;
+                user.email = body.email;
+                user.pendingTasks = newPending;
 
-                // Ensure two-way references: for tasks in saved.pendingTasks, set task assignedUser
-                // First, remove this user from tasks that are no longer pending
-                var toRemove = oldPending.filter(function (t) { return saved.pendingTasks.indexOf(t) === -1; });
-                var toAdd = saved.pendingTasks.filter(function (t) { return oldPending.indexOf(t) === -1; });
+                user.save(function (err, saved) {
+                    if (err) {
+                        if (err.code === 11000) return sendError(res, 400, 'Bad Request', 'A user with that email already exists');
+                        return sendError(res, 500, 'Internal Server Error', 'Error saving user');
+                    }
 
-                // Clear tasks that are no longer pending for this user
-                Task.updateMany({ _id: { $in: toRemove } }, { $set: { assignedUser: '', assignedUserName: 'unassigned' } }, function (e) {
-                    if (e) console.error('Error clearing tasks on user update', e);
+                    // Ensure two-way references: for tasks in saved.pendingTasks, set task assignedUser
+                    // First, remove this user from tasks that are no longer pending
+                    var toRemove = oldPending.filter(function (t) { return saved.pendingTasks.indexOf(t) === -1; });
+                    var toAdd = saved.pendingTasks.filter(function (t) { return oldPending.indexOf(t) === -1; });
 
-                    // Only assign tasks that are not completed. Completed tasks should not be pending.
-                    if (!toAdd || toAdd.length === 0) return sendSuccess(res, 200, 'OK', saved);
+                    // Clear tasks that are no longer pending for this user
+                    Task.updateMany({ _id: { $in: toRemove } }, { $set: { assignedUser: '', assignedUserName: 'unassigned' } }, function (e) {
+                        if (e) console.error('Error clearing tasks on user update', e);
 
-                    Task.find({ _id: { $in: toAdd }, completed: false }, function (e3, tasksToAssign) {
-                        if (e3) {
-                            console.error('Error finding tasks to assign on user update', e3);
-                            return sendSuccess(res, 200, 'OK', saved);
-                        }
+                        // Only assign tasks that are not completed. Completed tasks should not be pending.
+                        if (!toAdd || toAdd.length === 0) return sendSuccess(res, 200, 'OK', saved);
 
-                        var idsToAssign = (tasksToAssign || []).map(function (t) { return t._id; });
-                        if (!idsToAssign || idsToAssign.length === 0) return sendSuccess(res, 200, 'OK', saved);
-
-                        Task.updateMany({ _id: { $in: idsToAssign } }, { $set: { assignedUser: saved._id.toString(), assignedUserName: saved.name } }, function (e2) {
+                        // We validated the pending tasks already; assign them and remove from other users
+                        Task.updateMany({ _id: { $in: toAdd } }, { $set: { assignedUser: saved._id.toString(), assignedUserName: saved.name } }, function (e2) {
                             if (e2) console.error('Error assigning tasks on user update', e2);
-                            return sendSuccess(res, 200, 'OK', saved);
+                            // Remove these task ids from other users' pendingTasks
+                            User.updateMany({ _id: { $ne: saved._id }, pendingTasks: { $in: toAdd } }, { $pull: { pendingTasks: { $in: toAdd } } }, function (e3) {
+                                if (e3) console.error('Error cleaning other users pendingTasks on user update', e3);
+                                return sendSuccess(res, 200, 'OK', saved);
+                            });
                         });
                     });
                 });
@@ -220,34 +235,42 @@ module.exports = function (router) {
     tasksRoute.post(function (req, res) {
         var body = req.body || {};
         if (!body.name || !body.deadline) return sendError(res, 400, 'Bad Request', 'Task must have name and deadline');
-        if (!isValidDate(body.deadline)) return sendError(res, 400, 'Bad Request', 'Invalid deadline');
+        if (!validate.isValidDate(body.deadline)) return sendError(res, 400, 'Bad Request', 'Invalid deadline');
 
-        var task = new Task({
-            name: body.name,
-            description: body.description || '',
-            deadline: body.deadline,
-            completed: !!body.completed,
-            assignedUser: body.assignedUser || '',
-            assignedUserName: body.assignedUserName || (body.assignedUser ? 'assigned' : 'unassigned')
-        });
+        // Validate assignedUser/assignedUserName if provided (can provide id or name)
+        validate.findUserByIdOrName(body.assignedUser, body.assignedUserName, function (validation) {
+            if (!validation.valid) {
+                return sendError(res, 400, 'Bad Request', validation.error);
+            }
 
-        task.save(function (err, saved) {
-            if (err) return sendError(res, 500, 'Internal Server Error', 'Error saving task');
+            var task = new Task({
+                name: body.name,
+                description: body.description || '',
+                deadline: body.deadline,
+                completed: !!body.completed,
+                // set assignedUser to resolved user's id (if found), otherwise empty
+                assignedUser: validation.user ? validation.user._id.toString() : '',
+                // If user found, use their name; if no assignedUser, use 'unassigned'
+                assignedUserName: validation.user ? validation.user.name : 'unassigned'
+            });
 
-            // If assigned to a user, add to user's pendingTasks unless completed
-            if (saved.assignedUser && !saved.completed) {
-                User.findById(saved.assignedUser, function (e, user) {
-                    if (e || !user) return sendSuccess(res, 201, 'Created', saved);
-                    if (user.pendingTasks.indexOf(saved._id.toString()) === -1) {
-                        user.pendingTasks.push(saved._id.toString());
-                        user.save(function () { return sendSuccess(res, 201, 'Created', saved); });
+            task.save(function (err, saved) {
+                if (err) return sendError(res, 500, 'Internal Server Error', 'Error saving task');
+
+                // If assigned to a user and not completed, add to user's pendingTasks
+                if (validation.user && !saved.completed) {
+                    if (validation.user.pendingTasks.indexOf(saved._id.toString()) === -1) {
+                        validation.user.pendingTasks.push(saved._id.toString());
+                        validation.user.save(function () {
+                            return sendSuccess(res, 201, 'Created', saved);
+                        });
                     } else {
                         return sendSuccess(res, 201, 'Created', saved);
                     }
-                });
-            } else {
-                return sendSuccess(res, 201, 'Created', saved);
-            }
+                } else {
+                    return sendSuccess(res, 201, 'Created', saved);
+                }
+            });
         });
     });
 
@@ -268,55 +291,63 @@ module.exports = function (router) {
     taskIdRoute.put(function (req, res) {
         var body = req.body || {};
         if (!body.name || !body.deadline) return sendError(res, 400, 'Bad Request', 'Task must have name and deadline');
-        if (!isValidDate(body.deadline)) return sendError(res, 400, 'Bad Request', 'Invalid deadline');
+        if (!validate.isValidDate(body.deadline)) return sendError(res, 400, 'Bad Request', 'Invalid deadline');
 
         if (!validIdOr404(req.params.id, res)) return;
 
-        Task.findById(req.params.id, function (err, task) {
-            if (err || !task) return sendError(res, 404, 'Not Found', 'Task not found');
+        // First validate the assignedUser/assignedUserName if provided (id or name)
+        validate.findUserByIdOrName(body.assignedUser, body.assignedUserName, function (validation) {
+            if (!validation.valid) {
+                return sendError(res, 400, 'Bad Request', validation.error);
+            }
 
-            var oldAssigned = task.assignedUser || '';
+            Task.findById(req.params.id, function (err, task) {
+                if (err || !task) return sendError(res, 404, 'Not Found', 'Task not found');
 
-            task.name = body.name;
-            task.description = body.description || '';
-            task.deadline = body.deadline;
-            task.completed = !!body.completed;
-            task.assignedUser = body.assignedUser || '';
-            task.assignedUserName = body.assignedUserName || (body.assignedUser ? 'assigned' : 'unassigned');
+                var oldAssigned = task.assignedUser || '';
 
-            task.save(function (err, saved) {
-                if (err) return sendError(res, 500, 'Internal Server Error', 'Error saving task');
+                task.name = body.name;
+                task.description = body.description || '';
+                task.deadline = body.deadline;
+                task.completed = !!body.completed;
+                task.assignedUser = validation.user ? validation.user._id.toString() : '';
+                // If user found, use their name; if no assignedUser, use 'unassigned'
+                task.assignedUserName = validation.user ? validation.user.name : 'unassigned';
 
-                // maintain two-way refs
-                // if assigned changed, remove from old user's pendingTasks and add to new user's pendingTasks (if not completed)
-                var newAssigned = saved.assignedUser || '';
-                var ops = [];
-                if (oldAssigned && oldAssigned !== newAssigned) {
-                    ops.push(function (cb) {
-                        User.findById(oldAssigned, function (e, u) {
-                            if (u) {
-                                u.pendingTasks = (u.pendingTasks || []).filter(function (tid) { return tid !== saved._id.toString(); });
-                                u.save(function () { cb(); });
+                task.save(function (err, saved) {
+                    if (err) return sendError(res, 500, 'Internal Server Error', 'Error saving task');
+
+                    // maintain two-way refs
+                    var ops = [];
+
+                    // Remove from old user's pendingTasks if assigned changed
+                    if (oldAssigned && oldAssigned !== saved.assignedUser) {
+                        ops.push(function (cb) {
+                            User.findById(oldAssigned, function (e, u) {
+                                if (u) {
+                                    u.pendingTasks = (u.pendingTasks || []).filter(function (tid) { return tid !== saved._id.toString(); });
+                                    u.save(function () { cb(); });
+                                } else cb();
+                            });
+                        });
+                    }
+
+                    // Add to new user's pendingTasks if assigned and not completed
+                    if (validation.user && !saved.completed) {
+                        ops.push(function (cb) {
+                            if ((validation.user.pendingTasks || []).indexOf(saved._id.toString()) === -1) {
+                                validation.user.pendingTasks.push(saved._id.toString());
+                                validation.user.save(function () { cb(); });
                             } else cb();
                         });
-                    });
-                }
-                if (newAssigned && (!saved.completed)) {
-                    ops.push(function (cb) {
-                        User.findById(newAssigned, function (e, u) {
-                            if (u) {
-                                if ((u.pendingTasks || []).indexOf(saved._id.toString()) === -1) u.pendingTasks.push(saved._id.toString());
-                                u.save(function () { cb(); });
-                            } else cb();
-                        });
-                    });
-                }
+                    }
 
-                // run ops sequentially
-                (function run(i) {
-                    if (i >= ops.length) return sendSuccess(res, 200, 'OK', saved);
-                    ops[i](function () { run(i + 1); });
-                })(0);
+                    // run ops sequentially
+                    (function run(i) {
+                        if (i >= ops.length) return sendSuccess(res, 200, 'OK', saved);
+                        ops[i](function () { run(i + 1); });
+                    })(0);
+                });
             });
         });
     });
